@@ -1,0 +1,159 @@
+name: Build Windows CUDA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-cuda:
+    name: CUDA ${{ matrix.cuda }}
+    runs-on: windows-2022
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda: "12.4"
+            defines: "-DGGML_CUDA_CUB_3DOT2=ON"
+          - cuda: "13.3"
+            defines: ""
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      WINDOWS_BASEKIT_URL: https://developer.download.nvidia.com/compute/cuda
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup CUDA
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+          cuda_arch: x64
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: windows-cuda-${{ matrix.cuda }}
+
+      - name: Setup Visual Studio
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          echo Visual Studio environment loaded
+
+      - name: Configure
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            ${{ matrix.defines }}
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+
+          cmake --build build ^
+            --config Release ^
+            -j %NINJA_JOBS%
+
+      - name: Prepare package
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p package
+
+          echo "Copying llama.cpp binaries..."
+
+          cp build/bin/Release/llama-server.exe package/
+          cp build/bin/Release/llama-cli.exe package/ 2>/dev/null || true
+
+          echo "Copying CPU/backend DLLs..."
+
+          cp build/bin/Release/*.dll package/ 2>/dev/null || true
+
+          echo "Package contents:"
+          ls -lh package
+
+      - name: Bundle CUDA runtime
+        shell: bash
+        run: |
+          set -e
+
+          echo "Searching for CUDA runtime DLLs..."
+
+          CUDA_BIN="${CUDA_PATH}/bin"
+
+          if [ ! -d "$CUDA_BIN" ]; then
+            echo "ERROR: CUDA bin directory not found:"
+            echo "$CUDA_BIN"
+            exit 1
+          fi
+
+          echo "CUDA_PATH=$CUDA_PATH"
+          echo "CUDA_BIN=$CUDA_BIN"
+
+          # Copy CUDA runtime DLLs required by llama.cpp.
+          find "$CUDA_BIN" -maxdepth 1 -type f \
+            \( -iname "cudart64*.dll" \
+               -o -iname "cublas64*.dll" \
+               -o -iname "cublasLt64*.dll" \
+            \) \
+            -exec cp {} package/ \;
+
+          echo "CUDA DLLs:"
+          ls -lh package/*.dll
+
+      - name: Verify package
+        shell: bash
+        run: |
+          set -e
+
+          test -f package/llama-server.exe
+          test -f package/ggml-cuda.dll
+
+          echo
+          echo "======================================"
+          echo "Package verification"
+          echo "======================================"
+          echo
+
+          ls -lh package
+
+      - name: Create ZIP
+        shell: powershell
+        run: |
+          $zip = "llama-cuda-windows-x64-${{ matrix.cuda }}.zip"
+
+          Compress-Archive `
+            -Path "package\*" `
+            -DestinationPath $zip `
+            -Force
+
+          Write-Host ""
+          Write-Host "Created:"
+          Get-Item $zip | Format-List Name,Length,FullName
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-cuda-windows-x64-${{ matrix.cuda }}
+          path: llama-cuda-windows-x64-${{ matrix.cuda }}.zip
+          if-no-files-found: error
+          retention-days: 30
